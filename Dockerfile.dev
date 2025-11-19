@@ -1,0 +1,50 @@
+FROM rust:1.91-slim
+
+WORKDIR /app
+
+# OPTIMIZATION: Use BuildKit cache mounts for apt packages
+# This caches downloaded .deb files even if package list changes
+# Enable with: DOCKER_BUILDKIT=1 docker compose build
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache && \
+    apt-get update && \
+    apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    curl
+
+# OPTIMIZATION: Install cargo tools with cache mount
+# This caches cargo registry and git checkouts
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo install cargo-watch
+
+# OPTIMIZATION: Copy only Cargo files first for dependency caching
+# This layer is cached unless Cargo.toml or Cargo.lock changes
+COPY Cargo.toml Cargo.lock ./
+
+# OPTIMIZATION: Create dummy source files to build dependencies with cache mount
+# This allows Docker to cache the dependency build layer
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    mkdir -p src && \
+    echo "pub fn dummy() {}" > src/lib.rs && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src target/release/server* target/release/deps/server*
+
+# OPTIMIZATION: Now copy the actual source code
+# Only this layer and subsequent ones rebuild when you change code
+COPY . .
+
+# Create uploads directory for binary storage
+RUN mkdir -p /app/uploads
+
+# Expose port
+EXPOSE 8080
+
+# Run cargo watch for hot-reload (specify server binary)
+CMD ["cargo", "watch", "-x", "run --bin server"]
