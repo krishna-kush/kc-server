@@ -134,9 +134,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/{task_id}/stream", web::get().to(handlers::progress_stream))
             )
             .service(
-                web::resource("/merge")
+                web::scope("/merge")
                     .wrap(middleware::AuthMiddleware)
-                    .route(web::post().to(handlers::merge_binaries))
+                    .route("", web::post().to(handlers::merge_binaries))
+                    .route("/{task_id}/download", web::get().to(handlers::download_merged_binary))
             )
             // Notification routes (protected)
             .service(

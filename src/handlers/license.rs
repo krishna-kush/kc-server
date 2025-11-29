@@ -22,13 +22,13 @@ use crate::security::{
 pub async fn create_license(
     req: web::Json<CreateLicenseRequest>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     // Validate request
     req.validate()
         .map_err(|e| actix_web::error::ErrorBadRequest(format!("Validation error: {}", e)))?;
     
-    // TODO: Get user_id from JWT auth middleware
-    let user_id = "default_user".to_string();
+    let uid = user_id.into_inner();
     
     // Generate unique license ID and shared secret
     let license_id = format!("lic_{}", Uuid::new_v4().simple());
@@ -40,14 +40,14 @@ pub async fn create_license(
     let mut license = License::new(
         license_id.clone(),
         req.binary_id.clone(),
-        user_id,
+        uid.clone(),
         shared_secret,
     );
     
-    // Verify binary exists
+    // Verify binary exists and belongs to user
     let binary_collection = db.collection::<crate::models::Binary>("binaries");
     let binary = binary_collection
-        .find_one(doc! { "binary_id": &req.binary_id })
+        .find_one(doc! { "binary_id": &req.binary_id, "user_id": &uid })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?
         .ok_or_else(|| actix_web::error::ErrorNotFound("Binary not found"))?;
@@ -481,12 +481,11 @@ pub async fn verify_license(
 pub async fn get_license(
     license_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
-    // TODO: Add authentication and verify user owns this license
-    
     let collection = db.collection::<License>("licenses");
     let license = collection
-        .find_one(doc! { "license_id": license_id.as_str() })
+        .find_one(doc! { "license_id": license_id.as_str(), "user_id": user_id.into_inner() })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?
         .ok_or_else(|| actix_web::error::ErrorNotFound("License not found"))?;
@@ -499,13 +498,12 @@ pub async fn get_license(
 pub async fn get_license_stats(
     license_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
-    // TODO: Add authentication and verify user owns this license
-    
     // Get license
     let license_collection = db.collection::<License>("licenses");
     let license = license_collection
-        .find_one(doc! { "license_id": license_id.as_str() })
+        .find_one(doc! { "license_id": license_id.as_str(), "user_id": user_id.into_inner() })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?
         .ok_or_else(|| actix_web::error::ErrorNotFound("License not found"))?;
@@ -576,8 +574,8 @@ pub async fn update_license(
     license_id: web::Path<String>,
     req: web::Json<UpdateLicenseRequest>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
-    // TODO: Add authentication and verify user owns this license
     
     req.validate()
         .map_err(|e| actix_web::error::ErrorBadRequest(format!("Validation error: {}", e)))?;
@@ -638,7 +636,7 @@ pub async fn update_license(
     
     // Update license
     let result = collection.update_one(
-        doc! { "license_id": license_id.as_str() },
+        doc! { "license_id": license_id.as_str(), "user_id": user_id.into_inner() },
         update_doc,
     )
     .await
@@ -661,14 +659,14 @@ pub async fn update_license(
 pub async fn delete_license(
     license_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
-    // TODO: Add authentication and verify user owns this license
     
     let collection = db.collection::<License>("licenses");
     
     // Actually delete the license from the database
     let result = collection.delete_one(
-        doc! { "license_id": license_id.as_str() },
+        doc! { "license_id": license_id.as_str(), "user_id": user_id.into_inner() },
     )
     .await
     .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
@@ -690,14 +688,14 @@ pub async fn delete_license(
 pub async fn revoke_license(
     license_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
-    // TODO: Add authentication and verify user owns this license
-    
+    let uid = user_id.into_inner();
     let collection = db.collection::<License>("licenses");
     
     // Check if license exists
     let license = collection
-        .find_one(doc! { "license_id": license_id.as_str() })
+        .find_one(doc! { "license_id": license_id.as_str(), "user_id": &uid })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?
         .ok_or_else(|| actix_web::error::ErrorNotFound("License not found"))?;
@@ -713,7 +711,7 @@ pub async fn revoke_license(
     // Revoke the license
     let now = Utc::now().to_rfc3339();
     collection.update_one(
-        doc! { "license_id": license_id.as_str() },
+        doc! { "license_id": license_id.as_str(), "user_id": &uid },
         doc! {
             "$set": {
                 "revoked": true,
@@ -739,8 +737,18 @@ pub async fn revoke_license(
 pub async fn get_binary_analytics(
     binary_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
-    // TODO: Add authentication and verify user owns this binary
+    // Verify binary ownership
+    let binary_collection = db.collection::<crate::models::Binary>("binaries");
+    let exists = binary_collection
+        .count_documents(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? > 0;
+        
+    if !exists {
+        return Err(actix_web::error::ErrorNotFound("Binary not found"));
+    }
     
     let license_collection = db.collection::<License>("licenses");
     let attempt_collection = db.collection::<VerificationAttempt>("verification_attempts");
@@ -855,8 +863,18 @@ pub async fn get_binary_analytics(
 pub async fn list_licenses_for_binary(
     binary_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
-    // TODO: Add authentication and verify user owns this binary
+    // Verify binary ownership
+    let binary_collection = db.collection::<crate::models::Binary>("binaries");
+    let exists = binary_collection
+        .count_documents(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? > 0;
+        
+    if !exists {
+        return Err(actix_web::error::ErrorNotFound("Binary not found"));
+    }
     
     let collection = db.collection::<License>("licenses");
     let mut cursor = collection
@@ -890,6 +908,7 @@ pub struct ListLicensesQuery {
 pub async fn list_all_licenses(
     query: web::Query<ListLicensesQuery>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     use futures::stream::StreamExt;
     
@@ -899,7 +918,7 @@ pub async fn list_all_licenses(
     let attempts_collection = db.collection::<VerificationAttempt>("verification_attempts");
     
     // Build filter
-    let mut filter = doc! {};
+    let mut filter = doc! { "user_id": user_id.into_inner() };
     
     // Search by license_id
     if let Some(search) = &query.search {

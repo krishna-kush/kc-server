@@ -14,9 +14,21 @@ pub async fn get_license_history(
     license_id: web::Path<String>,
     query: web::Query<HistoryQuery>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     let limit = query.limit.unwrap_or(100).min(1000);
     let skip = query.skip.unwrap_or(0);
+    
+    // Verify license ownership
+    let license_collection = db.collection::<License>("licenses");
+    let exists = license_collection
+        .count_documents(doc! { "license_id": license_id.as_str(), "user_id": user_id.into_inner() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? > 0;
+        
+    if !exists {
+        return Err(actix_web::error::ErrorNotFound("License not found"));
+    }
     
     let collection = db.collection::<VerificationAttempt>("verification_attempts");
     
@@ -82,34 +94,55 @@ pub async fn get_license_history(
 /// GET /api/v1/telemetry/dashboard
 pub async fn get_dashboard_stats(
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
+    let uid = user_id.into_inner();
     let license_collection = db.collection::<License>("licenses");
     let attempt_collection = db.collection::<VerificationAttempt>("verification_attempts");
     
     // License statistics
     let total_licenses = license_collection
-        .count_documents(doc! {})
+        .count_documents(doc! { "user_id": &uid })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
     
     let active_licenses = license_collection
-        .count_documents(doc! { "revoked": false })
+        .count_documents(doc! { "user_id": &uid, "revoked": false })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
     
     let revoked_licenses = license_collection
-        .count_documents(doc! { "revoked": true })
+        .count_documents(doc! { "user_id": &uid, "revoked": true })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
+    
+    // Get user's binary IDs to filter verifications
+    let binary_collection = db.collection::<crate::models::Binary>("binaries");
+    let mut binary_cursor = binary_collection
+        .find(doc! { "user_id": &uid })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
+    
+    let mut user_binary_ids = Vec::new();
+    use futures::stream::StreamExt;
+    while let Some(doc) = binary_cursor.next().await {
+        if let Ok(binary) = doc {
+            user_binary_ids.push(binary.binary_id);
+        }
+    }
+    
+    let verification_filter = doc! { "binary_id": { "$in": &user_binary_ids } };
     
     // Verification statistics
     let total_verifications = attempt_collection
-        .count_documents(doc! {})
+        .count_documents(verification_filter.clone())
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
     
+    let mut success_filter = verification_filter.clone();
+    success_filter.insert("success", true);
     let successful_verifications = attempt_collection
-        .count_documents(doc! { "success": true })
+        .count_documents(success_filter)
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
     
@@ -117,15 +150,19 @@ pub async fn get_dashboard_stats(
     
     // Last 24 hours
     let yesterday = Utc::now() - Duration::hours(24);
+    let mut recent_filter = verification_filter.clone();
+    recent_filter.insert("timestamp", doc! { "$gte": yesterday.to_rfc3339() });
+    
     let verifications_last_24h = attempt_collection
-        .count_documents(doc! {
-            "timestamp": { "$gte": yesterday.to_rfc3339() }
-        })
+        .count_documents(recent_filter)
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
     
     // Most active licenses (top 10 by verification count)
     let pipeline = vec![
+        doc! {
+            "$match": verification_filter
+        },
         doc! {
             "$group": {
                 "_id": "$license_id",
@@ -194,7 +231,18 @@ pub async fn get_binary_verification_attempts(
     binary_id: web::Path<String>,
     query: web::Query<HistoryQuery>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
+    // Verify binary ownership
+    let binary_collection = db.collection::<crate::models::Binary>("binaries");
+    let exists = binary_collection
+        .count_documents(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? > 0;
+        
+    if !exists {
+        return Err(actix_web::error::ErrorNotFound("Binary not found"));
+    }
     let limit = query.limit.unwrap_or(20).min(100);
     let skip = query.skip.unwrap_or(0);
     

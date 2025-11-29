@@ -10,6 +10,7 @@ pub async fn merge_binaries(
     mut payload: Multipart,
     db: web::Data<Database>,
     progress_subscriber: web::Data<ProgressSubscriber>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     let mut base_binary: Option<Vec<u8>> = None;
     let mut overload_binary: Option<Vec<u8>> = None;
@@ -69,7 +70,7 @@ pub async fn merge_binaries(
     let task_id = Uuid::new_v4().to_string();
     let merge_task = MergeTask::new(
         task_id.clone(),
-        "anonymous".to_string(), // TODO: Get from auth
+        user_id.into_inner(),
         base_name.clone(),
         overload_name.clone(),
         mode.clone(),
@@ -131,13 +132,14 @@ pub async fn merge_binaries(
 pub async fn get_progress(
     task_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     use mongodb::bson::Bson;
     
     let collection = db.collection::<mongodb::bson::Document>("merge_tasks");
     
     let doc = collection
-        .find_one(mongodb::bson::doc! { "task_id": task_id.as_str() })
+        .find_one(mongodb::bson::doc! { "task_id": task_id.as_str(), "user_id": user_id.into_inner() })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
@@ -153,22 +155,8 @@ pub async fn get_progress(
             let error = d.get_str("error").ok();
             
             // Build full download URL with external weaver URL if relative path
-            let full_download_url = if let Some(url) = download_url {
-                if url.starts_with("http") {
-                    // Already absolute URL
-                    Some(url.to_string())
-                } else {
-                    // Relative URL from weaver - use external-facing weaver URL
-                    // WEAVER_EXTERNAL_URL for user-facing downloads (e.g., http://localhost:8081 or https://killcode.app/api/weaver)
-                    // Falls back to WEAVER_URL if not set
-                    let weaver_external = std::env::var("WEAVER_EXTERNAL_URL")
-                        .or_else(|_| std::env::var("WEAVER_URL"))
-                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
-                    Some(format!("{}{}", weaver_external, url))
-                }
-            } else {
-                None
-            };
+            // Return local proxy URL
+            let full_download_url = Some(format!("/merge/{}/download", task_id));
             
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "task_id": task_id,
@@ -176,7 +164,7 @@ pub async fn get_progress(
                 "percentage": percentage,
                 "message": message,
                 "binary_id": binary_id,
-                "download_url": full_download_url,
+                "download_url": format!("/merge/{}/download", task_id),
                 "error": error,
             })))
         },
@@ -184,4 +172,73 @@ pub async fn get_progress(
             "error": "Task not found"
         }))),
     }
+}
+
+pub async fn download_merged_binary(
+    task_id: web::Path<String>,
+    db: web::Data<Database>,
+    user_id: web::ReqData<String>,
+) -> Result<HttpResponse, Error> {
+    let collection = db.collection::<mongodb::bson::Document>("merge_tasks");
+    
+    // Verify ownership and get binary_id/download_url
+    let doc = collection
+        .find_one(mongodb::bson::doc! { "task_id": task_id.as_str(), "user_id": user_id.into_inner() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
+        .ok_or_else(|| actix_web::error::ErrorNotFound("Task not found"))?;
+        
+    let binary_id = doc.get_str("binary_id").ok();
+    let download_url = doc.get_str("download_url").ok();
+    
+    if binary_id.is_none() && download_url.is_none() {
+        return Ok(HttpResponse::NotFound().body("Binary not ready"));
+    }
+    
+    // Construct Weaver URL
+    // If we have binary_id, use /download/{id}
+    // If we have download_url (relative), use that
+    let weaver_url = std::env::var("WEAVER_URL")
+        .unwrap_or_else(|_| "http://weaver:8080".to_string());
+        
+    let target_url = if let Some(bid) = binary_id {
+        format!("{}/download/{}", weaver_url, bid)
+    } else {
+        format!("{}{}", weaver_url, download_url.unwrap())
+    };
+    
+    // Proxy request to Weaver
+    let client = reqwest::Client::new();
+    let resp = client.get(&target_url)
+        .send()
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to connect to weaver: {}", e)))?;
+        
+    if !resp.status().is_success() {
+        return Ok(HttpResponse::build(actix_web::http::StatusCode::from_u16(resp.status().as_u16()).unwrap())
+            .body("Failed to fetch binary from weaver"));
+    }
+    
+    let content_type = resp.headers().get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+        
+    let content_disposition = resp.headers().get("content-disposition")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+        
+    let mut builder = HttpResponse::Ok();
+    builder.content_type(content_type);
+    
+    if let Some(cd) = content_disposition {
+        builder.insert_header(("Content-Disposition", cd));
+    }
+    
+    // Stream response
+    let stream = resp.bytes_stream().map(|item| {
+        item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    });
+    
+    Ok(builder.streaming(stream))
 }

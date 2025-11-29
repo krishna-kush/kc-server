@@ -23,10 +23,10 @@ pub async fn upload_binary(
     mut payload: Multipart,
     db: web::Data<Database>,
     progress_subscriber: web::Data<ProgressSubscriber>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     let mut binary_data: Option<Vec<u8>> = None;
     let mut filename = String::from("binary.bin");
-    let mut user_id = String::from("anonymous"); // TODO: Get from auth middleware
     let mut description: Option<String> = None;
     
     // Parse multipart form data
@@ -47,11 +47,10 @@ pub async fn upload_binary(
                 binary_data = Some(data);
             }
             "user_id" => {
-                let mut data = Vec::new();
+                // Ignore user_id from form, use authenticated user
                 while let Some(chunk) = field.next().await {
-                    data.extend_from_slice(&chunk?);
+                    let _ = chunk?;
                 }
-                user_id = String::from_utf8_lossy(&data).to_string();
             }
             "description" => {
                 let mut data = Vec::new();
@@ -96,7 +95,8 @@ pub async fn upload_binary(
     let binary_record = Binary {
         id: None,
         binary_id: binary_id.clone(),
-        user_id: user_id.clone(),
+
+        user_id: user_id.into_inner(),
         original_name: filename.clone(),
         description,
         original_size,
@@ -364,11 +364,12 @@ pub async fn check_access(
 pub async fn get_binary(
     binary_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     let collection = db.collection::<Binary>("binaries");
     
     let binary = collection
-        .find_one(doc! { "binary_id": binary_id.as_str() })
+        .find_one(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
@@ -388,6 +389,7 @@ pub async fn update_binary(
     binary_id: web::Path<String>,
     update: web::Json<UpdateAccessRequest>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     let collection = db.collection::<Binary>("binaries");
     
@@ -416,7 +418,7 @@ pub async fn update_binary(
     }
     
     let result = collection
-        .update_one(doc! { "binary_id": binary_id.as_str() }, update_doc)
+        .update_one(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() }, update_doc)
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
@@ -438,6 +440,7 @@ pub async fn download_binary(
     binary_id: web::Path<String>,
     query: web::Query<std::collections::HashMap<String, String>>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     // Get license_id from query params
     let license_id = query.get("license_id")
@@ -448,7 +451,7 @@ pub async fn download_binary(
     // Load binary from database
     let binary_collection = db.collection::<Binary>("binaries");
     let binary = binary_collection
-        .find_one(doc! { "binary_id": binary_id.as_str() })
+        .find_one(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
         .ok_or_else(|| actix_web::error::ErrorNotFound("Binary not found"))?;
@@ -611,7 +614,19 @@ pub async fn download_binary(
 pub async fn get_executions(
     binary_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
+    // Verify ownership
+    let binary_collection = db.collection::<Binary>("binaries");
+    let exists = binary_collection
+        .count_documents(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e))? > 0;
+
+    if !exists {
+        return Err(actix_web::error::ErrorNotFound("Binary not found"));
+    }
+
     let executions = AccessControlService::get_executions(&db, &binary_id, 100)
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
@@ -633,14 +648,14 @@ pub struct ListBinariesQuery {
 pub async fn list_binaries(
     db: web::Data<Database>,
     query: web::Query<ListBinariesQuery>,
-    // TODO: Get user_id from auth middleware
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     use futures::stream::StreamExt;
     
     let collection = db.collection::<Binary>("binaries");
     
     // Build filter
-    let mut filter = doc! {};
+    let mut filter = doc! { "user_id": user_id.into_inner() };
     
     // Search by filename
     if let Some(search) = &query.search {
@@ -744,6 +759,7 @@ pub async fn list_binaries(
 pub async fn delete_binary(
     binary_id: web::Path<String>,
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
     let binary_id = binary_id.into_inner();
     
@@ -752,7 +768,7 @@ pub async fn delete_binary(
     // Fetch binary to get file path
     let collection = db.collection::<Binary>("binaries");
     let binary = collection
-        .find_one(doc! { "binary_id": &binary_id })
+        .find_one(doc! { "binary_id": &binary_id, "user_id": user_id.into_inner() })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     

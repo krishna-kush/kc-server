@@ -4,6 +4,7 @@ use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
+use mongodb::Database;
 
 /// SSE stream for progress updates
 pub struct ProgressStream {
@@ -29,7 +30,23 @@ impl Stream for ProgressStream {
 /// GET /api/progress/{task_id}/stream
 pub async fn progress_stream(
     task_id: web::Path<String>,
+    db: web::Data<mongodb::Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
+    // Verify task ownership
+    let collection = db.collection::<mongodb::bson::Document>("merge_tasks");
+    let exists = collection
+        .count_documents(mongodb::bson::doc! { 
+            "task_id": task_id.as_str(),
+            "user_id": user_id.into_inner()
+        })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? > 0;
+
+    if !exists {
+        return Err(actix_web::error::ErrorNotFound("Task not found"));
+    }
+
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://redis:6379".to_string());
     

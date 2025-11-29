@@ -82,10 +82,28 @@ pub struct RecentActivitySummary {
 /// GET /api/v1/analytics
 pub async fn get_analytics(
     db: web::Data<Database>,
+    user_id: web::ReqData<String>,
 ) -> Result<HttpResponse, Error> {
+    let uid = user_id.into_inner();
     let license_collection = db.collection::<License>("licenses");
     let attempt_collection = db.collection::<VerificationAttempt>("verification_attempts");
     let binary_collection = db.collection::<Binary>("binaries");
+
+    // Fetch user's binary IDs
+    let mut binary_cursor = binary_collection
+        .find(doc! { "user_id": &uid })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
+    
+    let mut user_binary_ids = Vec::new();
+    use futures::stream::StreamExt;
+    while let Some(doc) = binary_cursor.next().await {
+        if let Ok(binary) = doc {
+            user_binary_ids.push(binary.binary_id);
+        }
+    }
+    
+    let verification_filter = doc! { "binary_id": { "$in": &user_binary_ids } };
 
     // Fetch all data in parallel (using tokio::join!)
     let (
@@ -99,15 +117,15 @@ pub async fn get_analytics(
         geo_data,
         recent_activity,
     ) = tokio::join!(
-        get_total_verifications(&attempt_collection),
-        get_successful_verifications(&attempt_collection),
-        get_unique_machines(&attempt_collection),
-        get_license_counts(&license_collection),
-        get_hourly_activity(&attempt_collection),
-        get_daily_time_series(&attempt_collection),
-        get_top_binaries(&attempt_collection, &binary_collection),
-        get_geographic_distribution(&attempt_collection),
-        get_recent_activity(&attempt_collection),
+        get_total_verifications(&attempt_collection, verification_filter.clone()),
+        get_successful_verifications(&attempt_collection, verification_filter.clone()),
+        get_unique_machines(&attempt_collection, verification_filter.clone()),
+        get_license_counts(&license_collection, uid),
+        get_hourly_activity(&attempt_collection, verification_filter.clone()),
+        get_daily_time_series(&attempt_collection, verification_filter.clone()),
+        get_top_binaries(&attempt_collection, &binary_collection, verification_filter.clone()),
+        get_geographic_distribution(&attempt_collection, verification_filter.clone()),
+        get_recent_activity(&attempt_collection, verification_filter.clone()),
     );
 
     let total_verifications = total_verifications?;
@@ -133,23 +151,25 @@ pub async fn get_analytics(
     let prev_7d_start = now - Duration::days(14);
     let prev_7d_end = now - Duration::days(7);
 
+    let mut last_week_filter = verification_filter.clone();
+    last_week_filter.insert("timestamp", doc! {
+        "$gte": last_7d_start.to_rfc3339(),
+        "$lt": now.to_rfc3339(),
+    });
+    
     let last_week_count = attempt_collection
-        .count_documents(doc! {
-            "timestamp": {
-                "$gte": last_7d_start.to_rfc3339(),
-                "$lt": now.to_rfc3339(),
-            }
-        })
+        .count_documents(last_week_filter)
         .await
         .unwrap_or(0);
 
+    let mut prev_week_filter = verification_filter.clone();
+    prev_week_filter.insert("timestamp", doc! {
+        "$gte": prev_7d_start.to_rfc3339(),
+        "$lt": prev_7d_end.to_rfc3339(),
+    });
+
     let prev_week_count = attempt_collection
-        .count_documents(doc! {
-            "timestamp": {
-                "$gte": prev_7d_start.to_rfc3339(),
-                "$lt": prev_7d_end.to_rfc3339(),
-            }
-        })
+        .count_documents(prev_week_filter)
         .await
         .unwrap_or(0);
 
@@ -197,9 +217,10 @@ pub async fn get_analytics(
 
 async fn get_total_verifications(
     collection: &mongodb::Collection<VerificationAttempt>,
+    filter: mongodb::bson::Document,
 ) -> Result<i64, Error> {
     collection
-        .count_documents(doc! {})
+        .count_documents(filter)
         .await
         .map(|c| c as i64)
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))
@@ -207,9 +228,11 @@ async fn get_total_verifications(
 
 async fn get_successful_verifications(
     collection: &mongodb::Collection<VerificationAttempt>,
+    mut filter: mongodb::bson::Document,
 ) -> Result<i64, Error> {
+    filter.insert("success", true);
     collection
-        .count_documents(doc! { "success": true })
+        .count_documents(filter)
         .await
         .map(|c| c as i64)
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))
@@ -217,8 +240,10 @@ async fn get_successful_verifications(
 
 async fn get_unique_machines(
     collection: &mongodb::Collection<VerificationAttempt>,
+    filter: mongodb::bson::Document,
 ) -> Result<i64, Error> {
     let pipeline = vec![
+        doc! { "$match": filter },
         doc! {
             "$group": {
                 "_id": "$machine_fingerprint"
@@ -245,19 +270,20 @@ async fn get_unique_machines(
 
 async fn get_license_counts(
     collection: &mongodb::Collection<License>,
+    user_id: String,
 ) -> Result<(i64, i64, i64, i64), Error> {
     let total = collection
-        .count_documents(doc! {})
+        .count_documents(doc! { "user_id": &user_id })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? as i64;
 
     let active = collection
-        .count_documents(doc! { "revoked": false })
+        .count_documents(doc! { "user_id": &user_id, "revoked": false })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? as i64;
 
     let revoked = collection
-        .count_documents(doc! { "revoked": true })
+        .count_documents(doc! { "user_id": &user_id, "revoked": true })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))? as i64;
 
@@ -265,6 +291,7 @@ async fn get_license_counts(
     let now = Utc::now();
     let expired = collection
         .count_documents(doc! {
+            "user_id": &user_id,
             "license_type.type": "time_limited",
             "license_type.expires_at": { "$lt": now.to_rfc3339() },
             "revoked": false
@@ -277,16 +304,18 @@ async fn get_license_counts(
 
 async fn get_hourly_activity(
     collection: &mongodb::Collection<VerificationAttempt>,
+    filter: mongodb::bson::Document,
 ) -> Result<Vec<HourlyActivity>, Error> {
     // Get last 24 hours of data
     let now = Utc::now();
     let yesterday = now - Duration::hours(24);
+    
+    let mut match_filter = filter;
+    match_filter.insert("timestamp", doc! { "$gte": yesterday.to_rfc3339() });
 
     let pipeline = vec![
         doc! {
-            "$match": {
-                "timestamp": { "$gte": yesterday.to_rfc3339() }
-            }
+            "$match": match_filter
         },
         doc! {
             "$group": {
@@ -347,16 +376,18 @@ async fn get_hourly_activity(
 
 async fn get_daily_time_series(
     collection: &mongodb::Collection<VerificationAttempt>,
+    filter: mongodb::bson::Document,
 ) -> Result<(Vec<TimeSeriesPoint>, Vec<TimeSeriesPoint>), Error> {
     let now = Utc::now();
     let thirty_days_ago = now - Duration::days(30);
 
     // Get daily data for last 30 days
+    let mut daily_filter = filter.clone();
+    daily_filter.insert("timestamp", doc! { "$gte": thirty_days_ago.to_rfc3339() });
+    
     let pipeline = vec![
         doc! {
-            "$match": {
-                "timestamp": { "$gte": thirty_days_ago.to_rfc3339() }
-            }
+            "$match": daily_filter
         },
         doc! {
             "$group": {
@@ -409,11 +440,12 @@ async fn get_daily_time_series(
     // Generate monthly data (last 6 months)
     let six_months_ago = now - Duration::days(180);
     
+    let mut monthly_filter = filter.clone();
+    monthly_filter.insert("timestamp", doc! { "$gte": six_months_ago.to_rfc3339() });
+    
     let monthly_pipeline = vec![
         doc! {
-            "$match": {
-                "timestamp": { "$gte": six_months_ago.to_rfc3339() }
-            }
+            "$match": monthly_filter
         },
         doc! {
             "$group": {
@@ -481,8 +513,10 @@ async fn get_daily_time_series(
 async fn get_top_binaries(
     attempt_collection: &mongodb::Collection<VerificationAttempt>,
     binary_collection: &mongodb::Collection<Binary>,
+    filter: mongodb::bson::Document,
 ) -> Result<Vec<TopBinary>, Error> {
     let pipeline = vec![
+        doc! { "$match": filter },
         doc! {
             "$group": {
                 "_id": "$binary_id",
@@ -548,6 +582,7 @@ async fn get_top_binaries(
 
 async fn get_geographic_distribution(
     collection: &mongodb::Collection<VerificationAttempt>,
+    filter: mongodb::bson::Document,
 ) -> Result<Vec<GeographicData>, Error> {
     // Load GeoIP database from environment variable
     let geoip_path = std::env::var("GEOIP_DB_PATH")
@@ -562,6 +597,7 @@ async fn get_geographic_distribution(
     };
 
     let pipeline = vec![
+        doc! { "$match": filter },
         doc! {
             "$group": {
                 "_id": "$ip_address",
@@ -665,30 +701,34 @@ async fn get_geographic_distribution(
 
 async fn get_recent_activity(
     collection: &mongodb::Collection<VerificationAttempt>,
+    filter: mongodb::bson::Document,
 ) -> Result<(i64, i64, i64), Error> {
     let now = Utc::now();
     let day_ago = now - Duration::hours(24);
     let week_ago = now - Duration::days(7);
     let month_ago = now - Duration::days(30);
 
+    let mut last_24h_filter = filter.clone();
+    last_24h_filter.insert("timestamp", doc! { "$gte": day_ago.to_rfc3339() });
+    
     let last_24h = collection
-        .count_documents(doc! {
-            "timestamp": { "$gte": day_ago.to_rfc3339() }
-        })
+        .count_documents(last_24h_filter)
         .await
         .unwrap_or(0) as i64;
 
+    let mut last_7d_filter = filter.clone();
+    last_7d_filter.insert("timestamp", doc! { "$gte": week_ago.to_rfc3339() });
+    
     let last_7d = collection
-        .count_documents(doc! {
-            "timestamp": { "$gte": week_ago.to_rfc3339() }
-        })
+        .count_documents(last_7d_filter)
         .await
         .unwrap_or(0) as i64;
 
+    let mut last_30d_filter = filter.clone();
+    last_30d_filter.insert("timestamp", doc! { "$gte": month_ago.to_rfc3339() });
+    
     let last_30d = collection
-        .count_documents(doc! {
-            "timestamp": { "$gte": month_ago.to_rfc3339() }
-        })
+        .count_documents(last_30d_filter)
         .await
         .unwrap_or(0) as i64;
 
