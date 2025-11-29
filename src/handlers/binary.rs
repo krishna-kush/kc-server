@@ -474,11 +474,21 @@ pub async fn download_binary(
         let binary_bytes = std::fs::read(&cache_path)
             .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to read cached binary: {}", e)))?;
         
+        // Construct filename with license ID: name_license.ext
+        let path = std::path::Path::new(&binary.original_name);
+        let file_stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let extension = path.extension().unwrap_or_default().to_string_lossy();
+        let filename = if extension.is_empty() {
+            format!("{}_{}", file_stem, license_id)
+        } else {
+            format!("{}_{}.{}", file_stem, license_id, extension)
+        };
+
         return Ok(HttpResponse::Ok()
             .content_type("application/octet-stream")
             .insert_header((
                 "Content-Disposition",
-                format!("attachment; filename=\"{}\"", binary.original_name),
+                format!("attachment; filename=\"{}\"", filename),
             ))
             .body(binary_bytes));
     }
@@ -513,11 +523,14 @@ pub async fn download_binary(
         "log_level": "info",
     });
     
-    // Copy and patch overload
+    // Copy and patch overload with license data
+    // The #[link_section = ".license"] attribute creates a 4KB zero-filled section in both ELF and PE
+    // The patcher searches for this zero block and writes license JSON - format agnostic!
     let temp_overload_path = PathBuf::from(format!("/app/uploads/{}_{}_overload_temp", binary_id, license_id));
     std::fs::copy(&overload_template_path, &temp_overload_path)
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
+    // Try patching for both Linux and Windows - the zero-block search should work for both
     crate::services::license_patcher::patch_license_into_binary(
         temp_overload_path.to_str().unwrap(),
         &license_config.to_string(),
@@ -569,13 +582,23 @@ pub async fn download_binary(
             
             log::info!("✅ Merged binary cached: {}", cache_path.display());
             
+            // Construct filename with license ID: name_license.ext
+            let path = std::path::Path::new(&binary.original_name);
+            let file_stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let extension = path.extension().unwrap_or_default().to_string_lossy();
+            let filename = if extension.is_empty() {
+                format!("{}_{}", file_stem, license_id)
+            } else {
+                format!("{}_{}.{}", file_stem, license_id, extension)
+            };
+
             Ok(HttpResponse::Ok()
                 .content_type("application/octet-stream")
                 .insert_header((
                     "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", binary.original_name),
+                    format!("attachment; filename=\"{}\"", filename),
                 ))
-                .body(binary_bytes.to_vec()))
+                .body(binary_bytes))
         }
         Err(e) => {
             log::error!("❌ Failed to merge binary: {}", e);

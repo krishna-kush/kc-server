@@ -4,23 +4,24 @@
 use semver::Version;
 use std::fs;
 use std::path::{Path, PathBuf};
+use goblin::Object;
 
 /// Supported architectures
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
     // Linux
-    LinuxX8664,
-    LinuxX86,
-    LinuxAarch64,
-    LinuxArmv7,
+    LINUX_X86_64,
+    LINUX_X86,
+    LINUX_AARCH64,
+    LINUX_ARMV7,
     
     // Windows
-    WindowsX8664,
-    WindowsX86,
+    WINDOWS_X86_64,
+    WINDOWS_X86,
     
     // macOS
-    MacOSX8664,
-    MacOSArm64,
+    MACOS_X86_64,
+    MACOS_ARM64,
 }
 
 impl Architecture {
@@ -28,116 +29,99 @@ impl Architecture {
     pub fn as_str(&self) -> &'static str {
         match self {
             // Linux
-            Architecture::LinuxX8664 => "linux-x86_64",
-            Architecture::LinuxX86 => "linux-x86",
-            Architecture::LinuxAarch64 => "linux-arm64",
-            Architecture::LinuxArmv7 => "linux-armv7",
+            Architecture::LINUX_X86_64 => "linux-x86_64",
+            Architecture::LINUX_X86 => "linux-x86",
+            Architecture::LINUX_AARCH64 => "linux-arm64",
+            Architecture::LINUX_ARMV7 => "linux-armv7",
             
             // Windows
-            Architecture::WindowsX8664 => "windows-x86_64",
-            Architecture::WindowsX86 => "windows-x86",
+            Architecture::WINDOWS_X86_64 => "windows-x86_64",
+            Architecture::WINDOWS_X86 => "windows-x86",
             
             // macOS
-            Architecture::MacOSX8664 => "macos-x86_64",
-            Architecture::MacOSArm64 => "macos-arm64",
+            Architecture::MACOS_X86_64 => "macos-x86_64",
+            Architecture::MACOS_ARM64 => "macos-arm64",
         }
     }
 
     /// Detect architecture from binary data (supports ELF, PE, Mach-O)
     pub fn detect_from_binary(data: &[u8]) -> Self {
-        if data.len() < 64 {
-            return Architecture::LinuxX8664; // Default
-        }
-        
-        // Check ELF magic (Linux)
-        if &data[0..4] == b"\x7fELF" {
-            // ELF class: 1=32-bit, 2=64-bit (offset 4)
-            let class = data[4];
-            // ELF machine type is at offset 18 (2 bytes, little-endian)
-            let machine = u16::from_le_bytes([data[18], data[19]]);
-            
-            return match (machine, class) {
-                (0x3E, 2) => Architecture::LinuxX8664,    // x86-64
-                (0x03, 1) => Architecture::LinuxX86,      // x86 32-bit
-                (0xB7, 2) => Architecture::LinuxAarch64,  // AArch64
-                (0x28, 1) => Architecture::LinuxArmv7,    // ARM 32-bit
-                _ => Architecture::LinuxX8664,            // Unknown ELF, default
-            };
-        }
-        
-        // Check PE magic (Windows)
-        if &data[0..2] == b"MZ" {
-            // DOS header, find PE header offset at 0x3C (4 bytes)
-            if data.len() < 0x40 {
-                return Architecture::WindowsX8664; // Default for Windows
-            }
-            
-            let pe_offset = u32::from_le_bytes([
-                data[0x3C], data[0x3D], data[0x3E], data[0x3F]
-            ]) as usize;
-            
-            if pe_offset + 6 > data.len() {
-                return Architecture::WindowsX8664;
-            }
-            
-            // Check PE signature
-            if &data[pe_offset..pe_offset+4] == b"PE\0\0" {
-                // Machine type at PE offset + 4 (2 bytes)
-                let machine = u16::from_le_bytes([
-                    data[pe_offset + 4],
-                    data[pe_offset + 5]
-                ]);
-                
-                return match machine {
-                    0x8664 => Architecture::WindowsX8664,  // x86-64
-                    0x014C => Architecture::WindowsX86,    // x86 32-bit
-                    _ => Architecture::WindowsX8664,       // Unknown PE, default
-                };
-            }
-        }
-        
-        // Check Mach-O magic (macOS)
-        let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        match magic {
-            0xFEEDFACF => {
-                // Mach-O 64-bit, CPU type at offset 4
-                let cpu_type = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                match cpu_type {
-                    0x01000007 => Architecture::MacOSX8664,  // x86-64
-                    0x0100000C => Architecture::MacOSArm64,  // ARM64
-                    _ => Architecture::MacOSX8664,
+
+        match Object::parse(data) {
+            Ok(Object::Elf(elf)) => {
+                if elf.is_64 {
+                    match elf.header.e_machine {
+                        goblin::elf::header::EM_X86_64 => Architecture::LINUX_X86_64,
+                        goblin::elf::header::EM_AARCH64 => Architecture::LINUX_AARCH64,
+                        _ => Architecture::LINUX_X86_64,
+                    }
+                } else {
+                    match elf.header.e_machine {
+                        goblin::elf::header::EM_386 => Architecture::LINUX_X86,
+                        goblin::elf::header::EM_ARM => Architecture::LINUX_ARMV7,
+                        _ => Architecture::LINUX_X86,
+                    }
                 }
-            }
-            0xFEEDFACE => {
-                // Mach-O 32-bit (Intel)
-                Architecture::MacOSX8664
-            }
-            0xCAFEBABE | 0xBEBAFECA => {
-                // Universal binary, assume ARM64 for modern macs
-                Architecture::MacOSArm64
-            }
-            _ => Architecture::LinuxX8664, // Unknown format, default
+            },
+            Ok(Object::PE(pe)) => {
+                match pe.header.coff_header.machine {
+                    goblin::pe::header::COFF_MACHINE_X86_64 => Architecture::WINDOWS_X86_64,
+                    goblin::pe::header::COFF_MACHINE_X86 => Architecture::WINDOWS_X86,
+                    _ => Architecture::WINDOWS_X86_64,
+                }
+            },
+            Ok(Object::Mach(mach)) => {
+                match mach {
+                    goblin::mach::Mach::Binary(macho) => {
+                        match macho.header.cputype {
+                            goblin::mach::constants::cputype::CPU_TYPE_X86_64 => Architecture::MACOS_X86_64,
+                            goblin::mach::constants::cputype::CPU_TYPE_ARM64 => Architecture::MACOS_ARM64,
+                            _ => Architecture::MACOS_X86_64,
+                        }
+                    },
+                    goblin::mach::Mach::Fat(_) => {
+                        // Universal binaries (Fat) usually support both.
+                        // Defaulting to ARM64 for modern macOS compatibility.
+                        Architecture::MACOS_ARM64
+                    }
+                }
+            },
+            _ => Architecture::LINUX_X86_64, // Default or Unknown
         }
     }
     
     /// Detect architecture from current system
     pub fn detect() -> Self {
         // Default to x86_64 for system detection
-        Architecture::LinuxX8664
+        Architecture::LINUX_X86_64
+    }
+    
+    /// Check if this architecture is Windows
+    pub fn is_windows(&self) -> bool {
+        matches!(self, Architecture::WINDOWS_X86_64 | Architecture::WINDOWS_X86)
+    }
+    
+    /// Get the binary filename for this architecture (with extension if needed)
+    pub fn binary_filename(&self) -> &'static str {
+        if self.is_windows() {
+            "overload.exe"
+        } else {
+            "overload"
+        }
     }
     
     /// Parse architecture from string
     pub fn from_str(s: &str) -> Self {
         match s {
-            "linux-x86_64" | "x86_64" => Architecture::LinuxX8664,
-            "linux-x86" | "x86" => Architecture::LinuxX86,
-            "linux-arm64" | "aarch64" => Architecture::LinuxAarch64,
-            "linux-armv7" | "armv7" => Architecture::LinuxArmv7,
-            "windows-x86_64" => Architecture::WindowsX8664,
-            "windows-x86" => Architecture::WindowsX86,
-            "macos-x86_64" => Architecture::MacOSX8664,
-            "macos-arm64" => Architecture::MacOSArm64,
-            _ => Architecture::LinuxX8664, // Default
+            "linux-x86_64" | "x86_64" => Architecture::LINUX_X86_64,
+            "linux-x86" | "x86" => Architecture::LINUX_X86,
+            "linux-arm64" | "aarch64" => Architecture::LINUX_AARCH64,
+            "linux-armv7" | "armv7" => Architecture::LINUX_ARMV7,
+            "windows-x86_64" => Architecture::WINDOWS_X86_64,
+            "windows-x86" => Architecture::WINDOWS_X86,
+            "macos-x86_64" => Architecture::MACOS_X86_64,
+            "macos-arm64" => Architecture::MACOS_ARM64,
+            _ => Architecture::LINUX_X86_64, // Default
         }
     }
 }
@@ -170,7 +154,8 @@ pub fn get_latest_overload(base_dir: &Path, arch: Architecture) -> Result<PathBu
         if let Some(version_str) = path.file_name().and_then(|n| n.to_str()) {
             if let Ok(version) = Version::parse(version_str) {
                 // Check if overload binary exists for this version and architecture
-                let overload_path = path.join(arch.as_str()).join("overload");
+                // Use platform-specific filename (overload.exe for Windows, overload for others)
+                let overload_path = path.join(arch.as_str()).join(arch.binary_filename());
                 if overload_path.exists() && overload_path.is_file() {
                     versions.push((version, overload_path));
                 }
@@ -225,14 +210,14 @@ mod tests {
         }
 
         // Should select 1.2.0 (highest stable version)
-        let result = get_latest_overload(base, Architecture::LinuxX8664).unwrap();
+        let result = get_latest_overload(base, Architecture::LINUX_X86_64).unwrap();
         assert!(result.to_str().unwrap().contains("1.2.0"));
     }
 
     #[test]
     fn test_architecture_strings() {
-        assert_eq!(Architecture::LinuxX8664.as_str(), "linux-x86_64");
-        assert_eq!(Architecture::LinuxAarch64.as_str(), "linux-aarch64");
-        assert_eq!(Architecture::LinuxArm.as_str(), "linux-arm");
+        assert_eq!(Architecture::LINUX_X86_64.as_str(), "linux-x86_64");
+        assert_eq!(Architecture::LINUX_AARCH64.as_str(), "linux-arm64");
+        assert_eq!(Architecture::LINUX_ARMV7.as_str(), "linux-armv7");
     }
 }

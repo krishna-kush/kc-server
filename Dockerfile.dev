@@ -47,4 +47,4 @@ RUN mkdir -p /app/uploads
 EXPOSE 8080
 
 # Run cargo watch for hot-reload (specify server binary)
-CMD ["cargo", "watch", "-x", "run --bin server"]
+CMD ["cargo", "watch", "-i", "uploads", "-x", "run --bin server"]
