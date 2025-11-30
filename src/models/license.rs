@@ -394,4 +394,5 @@ pub struct LicenseListItem {
     pub revoked: bool,
     pub unique_computers: u64,
     pub verification_count: u64,
+    pub size: Option<u64>,
 }

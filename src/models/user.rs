@@ -10,6 +10,12 @@ pub struct User {
     pub password_hash: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub storage_used: i64,
+    #[serde(default)]
+    pub storage_original: i64,
+    #[serde(default)]
+    pub storage_merged: i64,
 }
 
 #[derive(Debug, Deserialize, Validate)]

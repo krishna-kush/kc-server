@@ -8,13 +8,14 @@ use uuid::Uuid;
 use std::path::PathBuf;
 use chrono::Utc;
 
-use crate::models::{Binary, UpdateAccessRequest, BinaryDetailsResponse, License, MergeTask};
+use crate::models::{User, Binary, License, UpdateAccessRequest, BinaryDetailsResponse, MergeTask};
 use crate::services::{BinaryPatcher, AccessControlService, ProgressSubscriber};
 use crate::services::license_patcher;
+use crate::services::storage::{StorageService, StorageType};
 use crate::overload::network::{AccessCheckRequest, AccessCheckResponse};
 use crate::security::generate_shared_secret;
-use crate::utils::get_overload_path;
 use actix_web::HttpRequest;
+use std::env;
 
 /// Upload a binary (no license creation, no merge)
 /// Just store the binary and return binary_id
@@ -72,14 +73,36 @@ pub async fn upload_binary(
     
     let original_size = user_binary.len() as u64;
     
+    // Check storage quota
+    let user = db
+        .collection::<User>("users")
+        .find_one(doc! { "_id": mongodb::bson::oid::ObjectId::parse_str(user_id.as_str()).unwrap() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
+        .ok_or_else(|| actix_web::error::ErrorNotFound("User not found"))?;
+
+    let quota: u64 = env::var("FREE_STORAGE_QUOTA")
+        .unwrap_or_else(|_| "5368709120".to_string())
+        .parse()
+        .unwrap_or(5368709120);
+
+    let storage_used = user.storage_used.max(0) as u64;
+
+    if storage_used + original_size > quota {
+        return Err(actix_web::error::ErrorPayloadTooLarge(
+            format!("Storage quota exceeded. Free space: {} bytes, Required: {} bytes", 
+                quota.saturating_sub(storage_used), original_size)
+        ));
+    }
+    
     // Generate unique binary ID
     let binary_id = format!("bin_{}", Uuid::new_v4().simple());
     
     log::info!("📦 Uploading binary: {} ({}) - {} bytes", filename, binary_id, original_size);
     
     // Prepare upload directory
-    let upload_dir = PathBuf::from("/app/uploads");
-    std::fs::create_dir_all(&upload_dir)
+    let binary_path = StorageService::get_original_binary_path(user_id.as_str(), &binary_id);
+    StorageService::ensure_dir(&binary_path).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
     // Detect binary architecture
@@ -87,8 +110,7 @@ pub async fn upload_binary(
     log::info!("🔍 Detected architecture: {}", arch.as_str());
     
     // Save user binary
-    let binary_path = upload_dir.join(format!("{}_original", binary_id));
-    std::fs::write(&binary_path, &user_binary)
+    tokio::fs::write(&binary_path, &user_binary).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
     // Create Binary record in database
@@ -117,6 +139,12 @@ pub async fn upload_binary(
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
     log::info!("✅ Binary saved: {} - {}", binary_id, filename);
+    
+    // Update user storage usage
+    StorageService::update_storage_stats(&db, &binary_record.user_id, original_size, StorageType::Original, true).await
+        .map_err(|e| {
+            log::error!("Failed to update user storage: {}", e);
+        }).ok();
     
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "binary_id": binary_id,
@@ -451,7 +479,7 @@ pub async fn download_binary(
     // Load binary from database
     let binary_collection = db.collection::<Binary>("binaries");
     let binary = binary_collection
-        .find_one(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.into_inner() })
+        .find_one(doc! { "binary_id": binary_id.as_str(), "user_id": user_id.as_str() })
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
         .ok_or_else(|| actix_web::error::ErrorNotFound("Binary not found"))?;
@@ -470,11 +498,11 @@ pub async fn download_binary(
     }
     
     // Check if merged binary is cached
-    let cache_path = PathBuf::from(format!("/app/uploads/{}_{}_merged", binary_id, license_id));
+    let cache_path = StorageService::get_merged_binary_path(user_id.as_str(), &binary_id, license_id);
     
     if cache_path.exists() {
         log::info!("✅ Serving cached merged binary: {}", cache_path.display());
-        let binary_bytes = std::fs::read(&cache_path)
+        let binary_bytes = tokio::fs::read(&cache_path).await
             .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to read cached binary: {}", e)))?;
         
         // Construct filename with license ID: name_license.ext
@@ -500,8 +528,8 @@ pub async fn download_binary(
     log::info!("🔨 Merging binary {} with license {} on-demand", binary_id, license_id);
     
     // Load original binary
-    let original_binary_path = PathBuf::from(&binary.file_path);
-    let user_binary = std::fs::read(&original_binary_path)
+    let original_binary_path = StorageService::get_original_binary_path(user_id.as_str(), &binary_id);
+    let user_binary = tokio::fs::read(&original_binary_path).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to read binary: {}", e)))?;
     
     // Get overload template for architecture
@@ -527,29 +555,31 @@ pub async fn download_binary(
     });
     
     // Copy and patch overload with license data
-    // The #[link_section = ".license"] attribute creates a 4KB zero-filled section in both ELF and PE
-    // The patcher searches for this zero block and writes license JSON - format agnostic!
-    let temp_overload_path = PathBuf::from(format!("/app/uploads/{}_{}_overload_temp", binary_id, license_id));
-    std::fs::copy(&overload_template_path, &temp_overload_path)
+    // Use temp dir for intermediate files
+    let temp_dir = std::env::temp_dir();
+    let temp_overload_path = temp_dir.join(format!("{}_{}_overload_temp", binary_id, license_id));
+    
+    tokio::fs::copy(&overload_template_path, &temp_overload_path).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
     // Try patching for both Linux and Windows - the zero-block search should work for both
+    // Note: patch_license_into_binary is synchronous/blocking, might need web::block if heavy
     crate::services::license_patcher::patch_license_into_binary(
         temp_overload_path.to_str().unwrap(),
         &license_config.to_string(),
     ).map_err(|e| actix_web::error::ErrorInternalServerError(format!("License patching failed: {}", e)))?;
     
-    let patched_overload = std::fs::read(&temp_overload_path)
+    let patched_overload = tokio::fs::read(&temp_overload_path).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
-    std::fs::remove_file(&temp_overload_path).ok();
+    let _ = tokio::fs::remove_file(&temp_overload_path).await;
     
     // Save temporarily for weaver
-    let temp_user_binary_path = PathBuf::from(format!("/app/uploads/{}_{}_original_temp", binary_id, license_id));
-    let temp_overload_final_path = PathBuf::from(format!("/app/uploads/{}_{}_overload_final", binary_id, license_id));
+    let temp_user_binary_path = temp_dir.join(format!("{}_{}_original_temp", binary_id, license_id));
+    let temp_overload_final_path = temp_dir.join(format!("{}_{}_overload_final", binary_id, license_id));
     
-    std::fs::write(&temp_user_binary_path, &user_binary)
+    tokio::fs::write(&temp_user_binary_path, &user_binary).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
-    std::fs::write(&temp_overload_final_path, &patched_overload)
+    tokio::fs::write(&temp_overload_final_path, &patched_overload).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
     // Call weaver to merge
@@ -567,8 +597,8 @@ pub async fn download_binary(
     ).await;
     
     // Cleanup temp files
-    std::fs::remove_file(&temp_user_binary_path).ok();
-    std::fs::remove_file(&temp_overload_final_path).ok();
+    let _ = tokio::fs::remove_file(&temp_user_binary_path).await;
+    let _ = tokio::fs::remove_file(&temp_overload_final_path).await;
     
     match merge_result {
         Ok(download_url) => {
@@ -580,10 +610,56 @@ pub async fn download_binary(
             let binary_bytes = response.bytes().await
                 .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Failed to read binary: {}", e)))?;
             
-            // Cache the merged binary
-            std::fs::write(&cache_path, &binary_bytes).ok();
+            // Check quota before caching
+            let user = db
+                .collection::<User>("users")
+                .find_one(doc! { "_id": mongodb::bson::oid::ObjectId::parse_str(user_id.as_str()).unwrap() })
+                .await
+                .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
+                .ok_or_else(|| actix_web::error::ErrorNotFound("User not found"))?;
+
+            let quota: u64 = env::var("FREE_STORAGE_QUOTA")
+                .unwrap_or_else(|_| "5368709120".to_string())
+                .parse()
+                .unwrap_or(5368709120);
+
+            let binary_size = binary_bytes.len() as u64;
+            let storage_used = user.storage_used.max(0) as u64;
             
-            log::info!("✅ Merged binary cached: {}", cache_path.display());
+            log::info!("💾 Caching check - Size: {}, Used: {}, Quota: {}", binary_size, storage_used, quota);
+
+            let allow_ram_serve = env::var("ALLOW_LICENSE_SERVE_VIA_RAM")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(true); // Default to true for backward compatibility if not set
+
+            if storage_used + binary_size <= quota {
+                // Cache the merged binary
+                if let Err(e) = StorageService::ensure_dir(&cache_path).await {
+                    log::error!("❌ Failed to create cache directory: {}", e);
+                } else {
+                    match tokio::fs::write(&cache_path, &binary_bytes).await {
+                        Ok(_) => {
+                            log::info!("✅ Merged binary cached: {}", cache_path.display());
+                            // Update user storage
+                            if let Err(e) = StorageService::update_storage_stats(&db, user_id.as_str(), binary_size, StorageType::Merged, true).await {
+                                log::error!("❌ Failed to update storage stats: {}", e);
+                            } else {
+                                log::info!("📊 Storage stats updated for user {}", user_id.as_str());
+                            }
+                        },
+                        Err(e) => log::error!("❌ Failed to write cached binary: {}", e),
+                    }
+                }
+            } else {
+                log::warn!("⚠️ Storage quota exceeded for user {}. Skipping cache for merged binary.", user_id.as_str());
+                
+                if !allow_ram_serve {
+                    return Err(actix_web::error::ErrorPayloadTooLarge(
+                        format!("Storage quota exceeded. Cannot cache license binary. Free space: {} bytes, Required: {} bytes", 
+                            quota.saturating_sub(storage_used), binary_size)
+                    ));
+                }
+            }
             
             // Construct filename with license ID: name_license.ext
             let path = std::path::Path::new(&binary.original_name);
@@ -773,12 +849,39 @@ pub async fn delete_binary(
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
     if let Some(binary) = binary {
-        // Delete file from disk if it exists
-        if !binary.file_path.is_empty() {
-            if let Err(e) = std::fs::remove_file(&binary.file_path) {
-                log::warn!("Failed to delete binary file {}: {}", binary.file_path, e);
+        let mut original_freed = binary.original_size; // Use DB value to ensure quota is reset even if file is missing
+        let mut merged_freed = 0;
+        
+        // Delete original file from disk if it exists
+        let path = StorageService::get_original_binary_path(&binary.user_id, &binary_id);
+        if path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                log::warn!("Failed to delete binary file {}: {}", path.display(), e);
             } else {
-                log::info!("✅ Deleted file: {}", binary.file_path);
+                log::info!("✅ Deleted file: {}", path.display());
+            }
+        } else {
+            log::warn!("⚠️ Binary file not found on disk: {}", path.display());
+        }
+        
+        // Delete overload template
+        let overload_path = StorageService::get_overload_path(&binary.user_id, &binary_id);
+        let _ = tokio::fs::remove_file(&overload_path).await;
+        
+        // Find and delete associated licenses and their merged files
+        let license_collection = db.collection::<License>("licenses");
+        let mut licenses_cursor = license_collection
+            .find(doc! { "binary_id": &binary_id })
+            .await
+            .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+            
+        while let Some(license) = licenses_cursor.next().await {
+            if let Ok(license) = license {
+                let merged_path = StorageService::get_merged_binary_path(&binary.user_id, &binary_id, &license.license_id);
+                if let Ok(metadata) = tokio::fs::metadata(&merged_path).await {
+                    merged_freed += metadata.len();
+                    let _ = tokio::fs::remove_file(merged_path).await;
+                }
             }
         }
         
@@ -789,18 +892,27 @@ pub async fn delete_binary(
             .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
         
         // Also delete associated licenses
-        let license_collection = db.collection::<License>("licenses");
         let delete_result = license_collection
             .delete_many(doc! { "binary_id": &binary_id })
             .await
             .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+            
+        // Update user storage
+        if original_freed > 0 {
+            StorageService::update_storage_stats(&db, &binary.user_id, original_freed, StorageType::Original, false).await?;
+        }
+        if merged_freed > 0 {
+            StorageService::update_storage_stats(&db, &binary.user_id, merged_freed, StorageType::Merged, false).await?;
+        }
         
-        log::info!("✅ Deleted binary {} and {} associated licenses", binary_id, delete_result.deleted_count);
+        log::info!("✅ Deleted binary {} and {} associated licenses. Freed {} bytes (Original: {}, Merged: {}).", 
+            binary_id, delete_result.deleted_count, original_freed + merged_freed, original_freed, merged_freed);
         
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "message": "Binary deleted successfully",
             "binary_id": binary_id,
             "licenses_deleted": delete_result.deleted_count,
+            "storage_freed": original_freed + merged_freed,
         })))
     } else {
         Err(actix_web::error::ErrorNotFound("Binary not found"))

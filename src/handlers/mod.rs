@@ -7,8 +7,9 @@ mod binary;
 pub mod license;
 pub mod telemetry;
 pub mod notification;
-pub mod stats;
 pub mod analytics;
+pub mod stats;
+pub mod settings;
 
 pub use auth::{auth, verify};
 pub use notification::{
@@ -34,3 +35,6 @@ pub use analytics::get_analytics;
 pub use merge::*;
 pub use health::*;
 pub use sse::*;
+pub use settings::{
+    get_storage_stats, delete_all_licenses, delete_all_binaries, get_cleanup_recommendations,
+};

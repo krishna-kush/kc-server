@@ -62,6 +62,9 @@ pub async fn auth(
                         password_hash,
                         created_at: now,
                         updated_at: now,
+                        storage_used: 0,
+                        storage_original: 0,
+                        storage_merged: 0,
                     };
 
                     match collection.insert_one(&new_user).await {

@@ -16,6 +16,7 @@ use crate::security::{
     verify_signature, validate_timestamp, generate_shared_secret,
     construct_signature_data,
 };
+use crate::services::storage::{StorageService, StorageType};
 
 /// Create a new license for a binary
 /// POST /api/v1/license/create
@@ -664,9 +665,27 @@ pub async fn delete_license(
     
     let collection = db.collection::<License>("licenses");
     
+    // Find license first to get binary_id
+    let license = collection
+        .find_one(doc! { "license_id": license_id.as_str(), "user_id": user_id.into_inner() })
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?
+        .ok_or_else(|| actix_web::error::ErrorNotFound("License not found"))?;
+        
+    // Delete merged binary file if exists
+    let license_dir = StorageService::get_license_dir(&license.user_id);
+    let merged_path = license_dir.join(format!("{}_{}_merged", license.binary_id, license.license_id));
+    
+    let mut freed_bytes = 0;
+    
+    if let Ok(metadata) = tokio::fs::metadata(&merged_path).await {
+        freed_bytes = metadata.len();
+        let _ = tokio::fs::remove_file(&merged_path).await;
+    }
+    
     // Actually delete the license from the database
     let result = collection.delete_one(
-        doc! { "license_id": license_id.as_str(), "user_id": user_id.into_inner() },
+        doc! { "license_id": license_id.as_str() },
     )
     .await
     .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Database error: {}", e)))?;
@@ -675,11 +694,15 @@ pub async fn delete_license(
         return Err(actix_web::error::ErrorNotFound("License not found"));
     }
     
-    log::info!("✅ License deleted: {}", license_id);
+    // Update user storage
+    StorageService::update_storage_stats(&db, &license.user_id, freed_bytes, StorageType::Merged, false).await?;
+    
+    log::info!("✅ License deleted: {}. Freed {} bytes.", license_id, freed_bytes);
     
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "message": "License deleted successfully",
         "license_id": license_id.as_str(),
+        "storage_freed": freed_bytes,
     })))
 }
 
@@ -917,8 +940,10 @@ pub async fn list_all_licenses(
     let instances_collection = db.collection::<BinaryInstance>("binary_instances");
     let attempts_collection = db.collection::<VerificationAttempt>("verification_attempts");
     
+    let user_id_str = user_id.into_inner();
+
     // Build filter
-    let mut filter = doc! { "user_id": user_id.into_inner() };
+    let mut filter = doc! { "user_id": &user_id_str };
     
     // Search by license_id
     if let Some(search) = &query.search {
@@ -997,6 +1022,14 @@ pub async fn list_all_licenses(
                     .await
                     .unwrap_or(0);
                 
+                // Calculate merged binary size
+                let merged_path = StorageService::get_merged_binary_path(&user_id_str, &license.binary_id, &license.license_id);
+                let size = if let Ok(metadata) = tokio::fs::metadata(&merged_path).await {
+                    Some(metadata.len())
+                } else {
+                    None
+                };
+                
                 licenses.push(crate::models::LicenseListItem {
                     license_id: license.license_id,
                     binary_id: license.binary_id,
@@ -1010,6 +1043,7 @@ pub async fn list_all_licenses(
                     revoked: license.revoked,
                     unique_computers,
                     verification_count,
+                    size,
                 });
             }
             Err(e) => log::error!("Error reading license: {}", e),

@@ -151,6 +151,15 @@ async fn main() -> std::io::Result<()> {
                     .route("/{id}/read", web::post().to(handlers::mark_as_read))
                     .route("/{id}", web::delete().to(handlers::delete_notification))
             )
+            // Settings routes (protected)
+            .service(
+                web::scope("/settings")
+                    .wrap(middleware::AuthMiddleware)
+                    .route("/storage", web::get().to(handlers::get_storage_stats))
+                    .route("/cleanup", web::get().to(handlers::get_cleanup_recommendations))
+                    .route("/delete-all-licenses", web::delete().to(handlers::delete_all_licenses))
+                    .route("/delete-all-binaries", web::delete().to(handlers::delete_all_binaries))
+            )
             .service(
                 web::scope("/protected")
                     .wrap(middleware::AuthMiddleware)
