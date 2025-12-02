@@ -62,10 +62,10 @@ pub async fn progress_stream(
             }
         };
         
-        let mut pubsub = match client.get_async_connection().await {
-            Ok(conn) => conn.into_pubsub(),
+        let mut pubsub = match client.get_async_pubsub().await {
+            Ok(ps) => ps,
             Err(e) => {
-                log::error!("Failed to get Redis connection: {}", e);
+                log::error!("Failed to get Redis pubsub connection: {}", e);
                 return;
             }
         };

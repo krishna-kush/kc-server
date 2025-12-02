@@ -633,18 +633,16 @@ async fn get_geographic_distribution(
                     // Parse IP address
                     match ip.parse::<std::net::IpAddr>() {
                         Ok(ip_addr) => {
-                            match reader.lookup::<maxminddb::geoip2::Country>(ip_addr) {
-                                Ok(country_data) => {
-                                    let country_name = country_data.country
-                                        .and_then(|c| {
-                                            c.names.map(|names| {
-                                                names.get("en")
-                                                    .map(|s| s.to_string())
-                                                    .unwrap_or_else(|| "Unknown".to_string())
-                                            })
-                                        })
-                                        .unwrap_or_else(|| "Unknown".to_string());
-                                    country_name
+                            match reader.lookup(ip_addr) {
+                                Ok(lookup_result) => {
+                                    match lookup_result.decode::<maxminddb::geoip2::Country>() {
+                                        Ok(Some(country_data)) => {
+                                            country_data.country.names.english
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| "Unknown".to_string())
+                                        }
+                                        _ => "Unknown".to_string()
+                                    }
                                 }
                                 Err(_) => "Unknown".to_string()
                             }

@@ -1,10 +1,11 @@
 /// License encryption using AES-256-GCM
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use base64::{Engine as _, engine::general_purpose};
-use rand::RngCore;
+use rand::rngs::OsRng;
+use rand::TryRngCore;
 
 /// Encrypt license JSON data
 pub fn encrypt_license(plaintext: &str, key: &[u8; 32]) -> Result<String, String> {
@@ -12,7 +13,7 @@ pub fn encrypt_license(plaintext: &str, key: &[u8; 32]) -> Result<String, String
     
     // Generate random nonce (96 bits for GCM)
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    OsRng.try_fill_bytes(&mut nonce_bytes).map_err(|e| format!("RNG error: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     
     // Encrypt
@@ -56,7 +57,7 @@ pub fn decrypt_license(encrypted: &str, key: &[u8; 32]) -> Result<String, String
 /// Generate a new 256-bit encryption key
 pub fn generate_encryption_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
+    OsRng.try_fill_bytes(&mut key).expect("RNG failure");
     key
 }
 

@@ -32,7 +32,7 @@ impl ProgressSubscriber {
 
     pub async fn subscribe_to_task(&self, task_id: String) -> Result<(), Box<dyn std::error::Error>> {
         let client = redis::Client::open(self.redis_url.as_str())?;
-        let mut pubsub = client.get_async_connection().await?.into_pubsub();
+        let mut pubsub = client.get_async_pubsub().await?;
         
         let channel = format!("progress:{}", task_id);
         pubsub.subscribe(&channel).await?;

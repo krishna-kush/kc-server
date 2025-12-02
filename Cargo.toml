@@ -5,40 +5,40 @@ edition = "2024"
 authors = ["Krishna Kushwaha"]
 
 [dependencies]
-actix-web = "4.9"
+actix-web = "4.12"
 actix-cors = "0.7"
-actix-multipart = "0.6"
-tokio = { version = "1.41", features = ["full"] }
+actix-multipart = "0.7"
+tokio = { version = "1.48", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-mongodb = "3.1"
-jsonwebtoken = "9.3"
-bcrypt = "0.15"
+mongodb = "3.4"
+jsonwebtoken = { version = "10.2", features = ["rust_crypto"] }
+bcrypt = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 dotenv = "0.15"
 env_logger = "0.11"
 log = "0.4"
-validator = { version = "0.18", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 futures = "0.3"
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager", "streams"] }
-reqwest = { version = "0.11", features = ["multipart", "json", "blocking", "stream"] }
-uuid = { version = "1.6", features = ["v4", "serde"] }
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager", "streams"] }
+reqwest = { version = "0.12", features = ["multipart", "json", "blocking", "stream"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
 sha2 = "0.10"
-hostname = "0.3"
+hostname = "0.4"
 semver = "1.0"  # For version management
 # Security dependencies for HMAC authentication
 hmac = "0.12"
 hex = "0.4"
-rand = "0.8"
-subtle = "2.5"  # For constant-time comparisons
+rand = "0.9"
+subtle = "2.6"  # For constant-time comparisons
 # Encryption dependencies
 aes-gcm = "0.10"
-base64 = "0.21"
+base64 = "0.22"
 # Rate limiting
-actix-governor = "0.5"
+actix-governor = "0.10"
 # GeoIP
-maxminddb = "0.24"
-goblin = "0.10.3"
+maxminddb = "0.27"
+goblin = "0.10.4"
 
 # Library for shared modules
 [lib]

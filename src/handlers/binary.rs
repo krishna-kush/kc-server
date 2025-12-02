@@ -34,11 +34,11 @@ pub async fn upload_binary(
     while let Some(item) = payload.next().await {
         let mut field = item?;
         let content_disposition = field.content_disposition();
-        let field_name = content_disposition.get_name().unwrap_or("");
+        let field_name = content_disposition.map_or("", |cd| cd.get_name().unwrap_or(""));
         
         match field_name {
             "binary" => {
-                if let Some(fname) = content_disposition.get_filename() {
+                if let Some(fname) = content_disposition.and_then(|cd| cd.get_filename()) {
                     filename = fname.to_string();
                 }
                 let mut data = Vec::new();
