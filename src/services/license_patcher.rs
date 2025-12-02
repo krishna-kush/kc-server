@@ -24,7 +24,8 @@ pub fn find_license_section_offset(binary_path: &str) -> Result<u64, String> {
     }
     
     use crate::utils::overload_version::Architecture;
-    let arch = Architecture::detect_from_binary(&buffer);
+    let arch = Architecture::detect_from_binary(&buffer)
+        .unwrap_or(Architecture::LINUX_X86_64);
     log::info!("🔎 Detected binary architecture: {:?}", arch);
     
     // Search for the license section marker (4096 bytes of zeros)

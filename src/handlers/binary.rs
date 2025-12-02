@@ -100,20 +100,25 @@ pub async fn upload_binary(
     
     log::info!("📦 Uploading binary: {} ({}) - {} bytes", filename, binary_id, original_size);
     
+    // Validate that the file is actually an executable binary (ELF, PE, or Mach-O)
+    let arch = crate::utils::Architecture::detect_from_binary(&user_binary)
+        .ok_or_else(|| {
+            log::warn!("❌ Invalid file upload attempt: {} is not a valid executable binary", filename);
+            actix_web::error::ErrorBadRequest(
+                "Invalid file type. Only executable binaries are supported (ELF, PE/Windows, Mach-O/macOS formats)."
+            )
+        })?;
+    log::info!("🔍 Detected architecture: {}", arch.as_str());
+    
     // Prepare upload directory
     let binary_path = StorageService::get_original_binary_path(user_id.as_str(), &binary_id);
     StorageService::ensure_dir(&binary_path).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
-    
-    // Detect binary architecture
-    let arch = crate::utils::Architecture::detect_from_binary(&user_binary);
-    log::info!("🔍 Detected architecture: {}", arch.as_str());
-    
     // Save user binary
     tokio::fs::write(&binary_path, &user_binary).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     
-    // Create Binary record in database
+    // Create Binary record in database (arch already validated above)
     let binary_record = Binary {
         id: None,
         binary_id: binary_id.clone(),

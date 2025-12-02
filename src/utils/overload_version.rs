@@ -44,12 +44,20 @@ impl Architecture {
         }
     }
 
-    /// Detect architecture from binary data (supports ELF, PE, Mach-O)
-    pub fn detect_from_binary(data: &[u8]) -> Self {
+    /// Check if the data is a valid executable binary (ELF, PE, or Mach-O)
+    pub fn is_valid_binary(data: &[u8]) -> bool {
+        matches!(
+            Object::parse(data),
+            Ok(Object::Elf(_)) | Ok(Object::PE(_)) | Ok(Object::Mach(_))
+        )
+    }
 
+    /// Detect architecture from binary data (supports ELF, PE, Mach-O)
+    /// Returns None if the file is not a valid binary
+    pub fn detect_from_binary(data: &[u8]) -> Option<Self> {
         match Object::parse(data) {
             Ok(Object::Elf(elf)) => {
-                if elf.is_64 {
+                let arch = if elf.is_64 {
                     match elf.header.e_machine {
                         goblin::elf::header::EM_X86_64 => Architecture::LINUX_X86_64,
                         goblin::elf::header::EM_AARCH64 => Architecture::LINUX_AARCH64,
@@ -61,17 +69,19 @@ impl Architecture {
                         goblin::elf::header::EM_ARM => Architecture::LINUX_ARMV7,
                         _ => Architecture::LINUX_X86,
                     }
-                }
+                };
+                Some(arch)
             },
             Ok(Object::PE(pe)) => {
-                match pe.header.coff_header.machine {
+                let arch = match pe.header.coff_header.machine {
                     goblin::pe::header::COFF_MACHINE_X86_64 => Architecture::WINDOWS_X86_64,
                     goblin::pe::header::COFF_MACHINE_X86 => Architecture::WINDOWS_X86,
                     _ => Architecture::WINDOWS_X86_64,
-                }
+                };
+                Some(arch)
             },
             Ok(Object::Mach(mach)) => {
-                match mach {
+                let arch = match mach {
                     goblin::mach::Mach::Binary(macho) => {
                         match macho.header.cputype {
                             goblin::mach::constants::cputype::CPU_TYPE_X86_64 => Architecture::MACOS_X86_64,
@@ -84,9 +94,10 @@ impl Architecture {
                         // Defaulting to ARM64 for modern macOS compatibility.
                         Architecture::MACOS_ARM64
                     }
-                }
+                };
+                Some(arch)
             },
-            _ => Architecture::LINUX_X86_64, // Default or Unknown
+            _ => None, // Not a valid binary
         }
     }
     

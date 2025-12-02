@@ -6,7 +6,7 @@ pub mod verification_attempt;
 pub mod binary_instance;
 pub mod notification;
 
-pub use user::{User, AuthRequest, AuthResponse, UserResponse};
+pub use user::{User, AuthRequest, AuthResponse, UserResponse, AuthProvider};
 pub use merge_task::MergeTask;
 pub use notification::{
     Notification, NotificationType, CreateNotificationRequest, UpdateNotificationRequest,

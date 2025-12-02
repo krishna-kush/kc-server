@@ -2,7 +2,6 @@ pub mod auth;
 mod health;
 mod merge;
 mod sse;
-mod check_email;
 mod binary;
 pub mod license;
 pub mod telemetry;
@@ -10,8 +9,10 @@ pub mod notification;
 pub mod analytics;
 pub mod stats;
 pub mod settings;
+pub mod google_oauth;
+pub mod security;
 
-pub use auth::{auth, verify};
+pub use auth::{auth, verify, login, request_otp, verify_otp_and_signup, verify_2fa};
 pub use notification::{
     get_notifications, create_notification, update_notification,
     mark_as_read, mark_all_as_read, delete_notification, clear_all_notifications,
@@ -19,7 +20,7 @@ pub use notification::{
 pub use health::health;
 pub use merge::{merge_binaries, get_progress};
 pub use sse::progress_stream;
-pub use check_email::check_email;
+pub use auth::check_email;
 pub use binary::{
     upload_binary, check_access, get_binary, update_binary,
     download_binary, get_executions, list_binaries, delete_binary,
@@ -37,4 +38,9 @@ pub use health::*;
 pub use sse::*;
 pub use settings::{
     get_storage_stats, delete_all_licenses, delete_all_binaries, get_cleanup_recommendations,
+};
+pub use google_oauth::{get_google_config, google_callback};
+pub use security::{
+    get_security_settings, toggle_2fa, add_password, change_password,
+    request_password_reset, verify_reset_otp,
 };
